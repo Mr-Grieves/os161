@@ -1,0 +1,514 @@
+/*
+ * Main.
+ */
+
+#include <types.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <lib.h>
+#include <machine/spl.h>
+#include <test.h>
+#include <synch.h>
+#include <thread.h>
+#include <curthread.h>
+#include <scheduler.h>
+#include <dev.h>
+#include <vfs.h>
+#include <vm.h>
+#include <syscall.h>
+#include <version.h>
+#include <pid.h>
+#include <syscall.h>
+#include <addrspace.h>
+#include "hello.c"
+#include <coremap.h>
+#include <pagetable.h>
+
+/*
+ * These two pieces of data are maintained by the makefiles and build system.
+ * buildconfig is the name of the config file the kernel was configured with.
+ * buildversion starts at 1 and is incremented every time you link a kernel.
+ *
+ * The purpose is not to show off how many kernels you've linked, but
+ * to make it easy to make sure that the kernel you just booted is the
+ * same one you just built.
+ */
+extern const int buildversion;
+extern const char buildconfig[];
+
+/*
+ * Copyright message for the OS/161 base code.
+ */
+static const char harvard_copyright[] =
+    "Copyright (c) 2000, 2001, 2002, 2003\n"
+    "   President and Fellows of Harvard College.  All rights reserved.\n";
+
+
+/*
+ * Initial boot sequence.
+ */
+static
+void
+boot(void)
+{
+	/*
+	 * The order of these is important!
+	 * Don't go changing it without thinking about the consequences.
+	 *
+	 * Among other things, be aware that console output gets
+	 * buffered up at first and does not actually appear until
+	 * dev_bootstrap() attaches the console device. This can be
+	 * remarkably confusing if a bug occurs at this point. So
+	 * don't put new code before dev_bootstrap if you don't
+	 * absolutely have to.
+	 *
+	 * Also note that the buffer for this is only 1k. If you
+	 * overflow it, the system will crash without printing
+	 * anything at all. You can make it larger though (it's in
+	 * dev/generic/console.c).
+	 */
+
+	kprintf("\n");
+	kprintf("OS/161 base system version %s\n", BASE_VERSION);
+	kprintf("%s", harvard_copyright);
+	kprintf("\n");
+
+	kprintf("Put-your-group-name-here's system version %s (%s #%d)\n",
+		GROUP_VERSION, buildconfig, buildversion);
+	kprintf("\n");
+
+	ram_bootstrap();
+	
+	cm_bootstrap();
+	
+	scheduler_bootstrap();
+	thread_bootstrap();
+	vfs_bootstrap();
+	dev_bootstrap();
+	vm_bootstrap();
+	kprintf_bootstrap();
+
+	/* Default bootfs - but ignore failure, in case emu0 doesn't exist */
+	vfs_setbootfs("emu0");
+
+
+	/*
+	 * Make sure various things aren't screwed up.
+	 */
+	assert(sizeof(userptr_t)==sizeof(char *));
+	assert(sizeof(*(userptr_t)0)==sizeof(char));
+	
+	allocatingKernel = 0;
+}
+
+/*
+ * Shutdown sequence. Opposite to boot().
+ */
+static
+void
+shutdown(void)
+{
+
+	kprintf("Shutting down.\n");
+
+	vfs_clearbootfs();
+	vfs_clearcurdir();
+	vfs_unmountall();
+
+	splhigh();
+
+	scheduler_shutdown();
+	thread_shutdown();
+}
+
+/*****************************************/
+
+int sys_printchar(int input){
+  if(input < 0 || input > 127){
+    kprintf("Outside of ASCII range\n");
+	DEBUG(DB_SYSCALL, "Printchar error %c", (char)input);
+    return -1;
+  }
+
+  else kprintf("%c",input);
+  return 0;
+}
+
+int sys_readchar(void){
+    int ch;    
+    while(1){
+	ch = getch(); //read string of length 1
+	if(ch == '\r'){
+	    ch = '\n';
+	    break;
+	}
+	if(ch == -1){
+	    ch = 0;
+	    break;
+	}
+	if(ch == 21){
+	    putch('\b');
+	    putch(' ');
+	    putch('\b');
+	    break;
+	}
+	if(ch >= 32 && ch <= 127)
+	    break;
+      } 
+     
+    return ch;
+}
+
+int sys_fork(struct trapframe* parentTF, int* retval){
+    
+    struct thread* child;
+    /* change prt[1] to a copy of vmspace */
+    /*if(numPID >= PROCESS_MAX) {
+	*retval = -1;
+	return EAGAIN;
+    }*/
+    
+    void** ptr = (void*)kmalloc(sizeof(void*)*2);
+    ptr[0] = parentTF;
+    ptr[1] = curthread->t_vmspace; 
+
+    /*if(pidCount > 20){
+	 *retval = -1;
+	 return ENOMEM;
+    }*/
+    
+    pidCount++;   
+    thread_fork("Child thread",ptr,0,(void*)md_forkentry,&child);
+    
+    /* some parent stuff */
+    //kprintf("Parent: child pid is %d\n",child->pid_ID);
+    
+    //lock_release(forkLock);  
+    thread_yield();
+    
+    *retval = child->pid_ID;
+    //kprintf("childPID: %d \n",child->pid_ID); 
+    return 0;  
+}
+
+int sys_getpid(int *retval) {
+  *retval = curthread->pid_ID;
+  return 0;
+}
+
+void sys_exit(int value) {
+  
+  pid_setExit(curthread->pid_ID, value); 
+  pidCount--;
+  thread_exit();
+  
+  panic("Shouldn't have got here, oh sh--");
+}
+
+int sys_waitpid(int pid, int *status, int options, int *err) {
+  /*Checks!*/
+ 
+  //Bad PID
+  if (pid <= 0) {
+    *err = EINVAL;
+    return -1;
+  }
+  
+  //Not real PID
+  if (pid_hash[pid % PROCESS_MAX] == NULL) {
+    *err = EINVAL;
+    return -1;
+  }
+  
+  //In kernel space
+  if (status >= (int*)USERTOP) {
+    *err = EFAULT;
+    return -1;
+  }
+  
+  //This will make more sense after lab 3
+  if (status == (int*)0x40000000) {
+    *err = EFAULT;
+    return -1;
+  }
+  
+  //Who the hell passes an unaligned status
+  if ((int)status % 4 != 0) {
+    *err = EFAULT;
+    return -1;
+  }
+  
+  //No waiting on parents, yo 
+  if (pid == pid_hash[curthread->pid_ID % PROCESS_MAX]->ppid) {
+    *err = EINVAL;
+    return -1;
+  }
+  
+  if (options != 0) {
+    *err = EINVAL;
+    return -1;
+  }
+  
+  return pid_wait(pid, status, options);
+}
+
+/*
+ * reboot() system call.
+ *
+ * Note: this is here because it's directly related to the code above,
+ * not because this is where system call code should go. Other syscall
+ * code should probably live in the "userprog" directory.
+ */
+
+
+int
+sys_reboot(int code)
+{
+	switch (code) {
+	    case RB_REBOOT:
+	    case RB_HALT:
+	    case RB_POWEROFF:
+		break;
+	    default:
+		return EINVAL;
+	}
+
+	shutdown();
+
+	switch (code) {
+	    case RB_HALT:
+		kprintf("The system is halted.\n");
+		md_halt();
+		break;
+	    case RB_REBOOT:
+		kprintf("Rebooting...\n");
+		md_reboot();
+		break;
+	    case RB_POWEROFF:
+		kprintf("The system is halted.\n");
+		md_poweroff();
+		break;
+	}
+
+	panic("reboot operation failed\n");
+	return 0;
+}
+
+//Execv
+int sys_execv(char* progname, char** args, int *retval) {
+  
+	lock_acquire(pid_lock);
+	int PATH_MAX = 50;
+	int argc = 0;
+	
+	if(progname == NULL || progname == (int*)0x40000000 || args == (int*)0x40000000 
+          || args == NULL || progname >= (int*)USERTOP || args >= (int*)USERTOP)
+	{  
+		*retval = -1;
+		lock_release(pid_lock);
+		return EFAULT;
+	}
+
+	if(*progname == '\0')
+	{
+		*retval = -1;
+		lock_release(pid_lock);
+		return EISDIR;
+	}
+	
+	while(args[argc] != NULL){
+		argc++;
+		if(args[argc] >= (int*)USERTOP || args[argc] == 0x40000000){			
+			*retval = -1;
+			lock_release(pid_lock);
+			return EFAULT;
+		}
+	}
+	
+	char *fname = (char *)kmalloc(PATH_MAX);
+	size_t size;
+	copyinstr((userptr_t)progname,fname,PATH_MAX,&size);	
+
+	char **argv;
+	argv = (char **)kmalloc(sizeof(char*));
+
+	// Copy in all the argumens in args
+	size_t arglen;
+	int i;
+	for(i = 0; i < argc; i++) {
+		int len = strlen(args[i])+1;
+		len++;
+		argv[i]=(char*)kmalloc(len);
+		copyinstr((userptr_t)args[i], argv[i], len, &arglen);
+  	}
+  	
+  	//Null terminate argv
+  	argv[argc] = NULL;
+	//destroy the address space for a new loadelf
+	if(curthread->t_vmspace != NULL)
+	{
+		as_destroy(curthread->t_vmspace);
+		curthread->t_vmspace=NULL;
+	}
+	
+	/*EVERYTHING PAST THIS IS RUN PROGRAM*/
+	
+// 	struct vnode *v;
+// 	vaddr_t entrypoint, stackptr;
+// 	int result;
+// 	
+// 	/* Open the file. */
+// 	result = vfs_open(progname, O_RDONLY, &v);
+// 	if (result) {
+// 		return result;
+// 	}
+// 
+// 	/* We should be a new thread. */
+// 	assert(curthread->t_vmspace == NULL);
+// 
+// 	/* Create a new address space. */
+// 	curthread->t_vmspace = as_create();
+// 	if (curthread->t_vmspace==NULL) {
+// 		vfs_close(v);
+// 		*retval = -1;
+// 		return ENOMEM;
+// 	}
+
+	vaddr_t entrypoint, stackptr;
+	int result;
+	/* We should be a new thread. */
+	assert(curthread->t_vmspace == NULL);
+
+	/* Create a new address space. */
+	curthread->t_vmspace = as_create();
+	
+	/* Open the file. */
+	result = vfs_open(fname, O_RDONLY, &(curthread->t_vmspace->v));
+	
+	if (result) {
+		kprintf("vfs sucks\n");
+		return result;
+	}
+
+	if (curthread->t_vmspace==NULL) {
+		vfs_close(curthread->t_vmspace->v);
+		kprintf("as_create sucks\n");
+		return ENOMEM;
+	}
+
+	/* Activate it. */
+	as_activate(curthread->t_vmspace);
+
+	/* Load the executable. */
+	result = load_elf((curthread->t_vmspace->v), &entrypoint);
+	if (result) {
+		/* thread_exit destroys curthread->t_vmspace */
+		kprintf("load elf sucks\n");
+		vfs_close((curthread->t_vmspace->v));
+		*retval = -1;
+		return result;
+	}
+
+	/* Done with the file now. */
+	//vfs_close((curthread->t_vmspace->v));
+
+	/* Define the user stack in the address space */
+	result = as_define_stack(curthread->t_vmspace, &stackptr);
+	if (result) {
+		/* thread_exit destroys curthread->t_vmspace */
+		*retval = -1;
+		return result;
+	}
+	
+	//Write to stack, stuff, stuff, and stuff
+	char **user_argv = kmalloc(sizeof(char*) * (argc + 1));
+	user_argv[argc] = NULL;
+	
+	
+	for (i = argc - 1; i >= 0; i--) {
+	  int length = strlen(argv[i]) + 1;
+	  int padding = 4 - length % 4; 
+	  stackptr -= length + padding;
+	  copyoutstr(argv[i], stackptr, length, NULL);
+	  user_argv[i] = stackptr;
+	}
+	
+	
+	for (i = argc; i >= 0; i--) {
+	  stackptr -= 4;
+	  copyout(&(user_argv[i]), stackptr, sizeof(4));
+	}
+	 
+	 lock_release(pid_lock);
+	/* Warp to user mode. */
+	md_usermode(argc, stackptr,
+		    stackptr, entrypoint);
+	
+	/* md_usermode does not return */
+	panic("md_usermode returned\n");
+	return EINVAL;  
+}
+
+int sys_sbrk(int amount, int* retval){
+	struct addrspace* as;
+	as = curthread->t_vmspace;
+	
+	//do some checks
+	  //page overflow?
+	  as->heap_npages = (as->heap_vtop + amount - as->heap_vbase)/PAGE_SIZE + 1;
+	  
+	  //reached stack?
+	  if(as->heap_vbase + amount >= as->as_stackpbase){
+	      kprintf("sbrk: reached stack\n");
+	      *retval = -1;
+	      return ENOMEM;
+	  }
+	  
+	  //dropped below init value?
+	  if(as->heap_vtop+amount < as->heap_vbase){
+	      kprintf("sbrk: dropped below init value\n");
+	      *retval = -1;
+	      return EINVAL;
+	  }
+	  
+	  //check if we have room 
+	  int i,numSet=0;//,swaps = amount/PAGE_SIZE - cm_numFree;
+	  for(i = 0; i< swap_map_size; i++){
+		if(bitmap_isset(swap_map,i))
+		    numSet++;
+	  }
+	  
+	  kprintf("\n\nAmount %d\n", amount);
+	  
+	  if((amount/PAGE_SIZE) > (swap_map_size - numSet)-50){
+	      kprintf("not enough disk space to sbrk\n");
+	      *retval = -1;
+	      return ENOMEM;
+	  }
+	  
+	  //if we are de-allocating stack, call k_freepages
+	  /*    */
+	 
+	// set return value 
+	*retval = as->heap_vtop;
+	
+	//increment
+	//kprintf("sbrk: old base: %x  old break: %x\n", as->heap_vbase,as->heap_vtop); 
+	as->heap_vtop += amount;
+	//kprintf("sbrk: new base: %x  new break: %x\n", as->heap_vbase,as->heap_vtop);
+	return 0;
+}
+
+/*
+ * Kernel main. Boot up, then fork the menu thread; wait for a reboot
+ * request, and then shut down.
+ */
+int
+kmain(char *arguments)
+{
+	boot();
+	menu(arguments);
+
+	/* Should not get here */
+	return 0;
+}

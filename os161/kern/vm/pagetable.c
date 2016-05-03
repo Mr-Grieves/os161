@@ -1,0 +1,176 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <coremap.h>
+#include <bitmap.h>
+#include <pagetable.h>
+#include <thread.h>
+#include <curthread.h>
+
+
+struct pagetable* 
+pt_create(void)
+{
+	struct pagetable *pt = kmalloc(sizeof(struct pagetable)); 
+	pt->PT = kmalloc(1024*sizeof(int*)); 
+	if (pt==NULL) {
+		return NULL;
+	}
+	int i;     
+	for(i = 0; i < 1024 ; i++){
+	    pt->PT[i] = NULL;
+	}
+	return pt;
+}
+
+// input: PT, vaddr
+// output: paddr
+unsigned int*   
+pt_read(struct pagetable* pt, vaddr_t vaddr)
+{
+	int PT1ind, PT2ind, offset, paddr, entry, filesize;
+	struct addrspace* as = curthread->t_vmspace;
+	PT1ind = (vaddr&0xffc00000)>>22;
+	PT2ind = (vaddr&0x3ff000)>>12;
+	offset = vaddr&0xfff;
+	//kprintf("read on vaddr: %x  PT1: %d  PT2: %d\n",vaddr, PT1ind, PT2ind);
+	
+	if(pt->PT[PT1ind] == NULL){
+	      //kprintf("read: first level doesnt exist\n");
+	      pt->PT[PT1ind] = kmalloc(1024*sizeof(unsigned int*));
+	      int i;
+	      for(i = 0; i < 1024 ; i++)
+		  pt->PT[PT1ind][i] = 0;	
+	}
+	
+	if((pt->PT)[PT1ind][PT2ind] == 0){//page miss
+	      // read from disk
+	      //kprintf("read: second level doesnt exist, reading it from disk\n");
+	      unsigned int entry = getppages(1)&0xfffff000;
+	      //kprintf("getppages returns: %x\n",entry);
+	      int filesize;
+	      assert(as);
+	      
+	      pt->PT[PT1ind][PT2ind] = entry;
+	      // make valid and dirty
+	      pt->PT[PT1ind][PT2ind] = pt->PT[PT1ind][PT2ind]|TLBLO_DIRTY|TLBLO_VALID;
+	      TLB_Random(vaddr&0xfffff000,(pt->PT)[PT1ind][PT2ind]);
+	      
+	      //lock_acquire(swap_lock);
+	      
+	      if(vaddr >= as->text_vbase && vaddr < as->data_vbase){ //we are in the text region	      
+		  // set filesize
+		  filesize = (as->text_filesize < PAGE_SIZE)? as->text_filesize%PAGE_SIZE : PAGE_SIZE;	      
+		  
+		  // page align vaddr
+		  vaddr = vaddr&0xfffff000;	
+		  //kprintf("loading text segment\n");
+		  load_segment(as->v, as->text_offset + vaddr - as->text_vbase,
+			       vaddr, PAGE_SIZE, filesize, 1);
+			       
+	      } else if(vaddr >= as->data_vbase && vaddr < as->heap_vbase){ //we are in data		
+		  // set filesize
+		  filesize = (as->data_filesize < PAGE_SIZE)? as->data_filesize : PAGE_SIZE;	      
+		 
+		  // page align vaddr
+		  vaddr = vaddr&0xfffff000;	
+		  //kprintf("loading data segment\n");
+		  load_segment(as->v, as->data_offset + vaddr - as->data_vbase,
+			       vaddr, PAGE_SIZE, filesize, 1);			
+	
+	      } else if(vaddr == as->heap_vbase + PAGE_SIZE*as->heap_npages){ //heap 
+		    kprintf("incrementing heap, new top\n");
+		    as->heap_vtop += PAGE_SIZE;
+	      } else if(vaddr == as->as_stackpbase){ //stack
+		    kprintf("incrementing stack, new base: %x\n",as->as_stackpbase - PAGE_SIZE);
+		    as->as_stackpbase -= PAGE_SIZE;  
+	      } //else
+	      
+	      //kprintf("passing this to cm map; vaddr: %x   paddr: %x\n",vaddr&0xfffff000,(pt->PT)[PT1ind][PT2ind]&0xFFFFF000);
+	      cm_map(curthread->t_vmspace, vaddr&0xfffff000, (pt->PT)[PT1ind][PT2ind]&0xFFFFF000);
+	      
+	      //lock_release(swap_lock);
+	      
+	      return pt->PT[PT1ind][PT2ind];
+	}
+	
+	/* page hit */
+	// is it swapped?
+	paddr = pt->PT[PT1ind][PT2ind];
+	if(paddr&TLBLO_SWAPPED){//its swapped...shit
+	    //paddr = getpages
+	    entry = getppages(1)&0xfffff600;
+	    
+	    //vop read from disk 
+	    struct uio u;
+	    int result;
+	    vfs_sync();
+	    mk_kuio(&u, PADDR_TO_KVADDR(entry), PAGE_SIZE, paddr&0xfffff000, UIO_READ);
+	    result = VOP_READ(swap_vnode, &u);	    
+	    //if(result)
+		//kprintf("VOP failed\n");
+	    
+	    //kprintf("swapping in, this entry: %x from this disk offset: %x, at this vaddr: %x\n",entry,
+//paddr&0xfffff000, vaddr);
+	    //bitmap_unmark(swap_map, paddr&0xfffff000>>12);
+	    //write new entry
+	    assert(pt->PT[PT1ind] != NULL);
+	    pt->PT[PT1ind][PT2ind] = entry|TLBLO_DIRTY|TLBLO_VALID;
+	    
+	    cm_map(curthread->t_vmspace, vaddr&0xfffff000, (pt->PT)[PT1ind][PT2ind]&0xFFFFF000);
+	}
+	
+	// frame is allocated, put in it the TLB
+	// TLB_Probe() ??
+	//kprintf("mapping: vaddr: %x  padder: %x\n", vaddr&0xfffff000,(pt->PT)[PT1ind][PT2ind]&0xFFFFF000);
+	TLB_Random(vaddr&0xfffff000,(pt->PT)[PT1ind][PT2ind]);
+	return pt->PT[PT1ind][PT2ind];
+}
+
+
+void pt_protection(struct addrspace* as, vaddr_t vaddr) {
+  int PT1ind, PT2ind;
+  PT1ind = (vaddr&0xffc00000)>>22;
+  PT2ind = (vaddr&0x3ff000)>>12;
+  
+  struct addrspace *temp;
+  
+  int phys = (as->as_pagetable->PT)[PT1ind][PT2ind]&0xFFFFF000;
+  int temptempthing = phys;
+  phys -= cm_base;
+  phys /= PAGE_SIZE;
+  
+  if (coremap[phys].list == NULL) {
+    kprintf("\nDIED ON FRAME %d\n\n", phys);
+    panic("WTF THIS NEVER SHOULD HAVE HAPPENED\n");
+  }
+  
+  unsigned wtf = (coremap[phys].list->as->as_pagetable->PT)[PT1ind][PT2ind]&0xfffff000;
+  
+  cm_unmap(as, temptempthing);
+ 
+  int newFrame = getppages(1);
+  int phyAddr = newFrame;
+  
+  assert(coremap[(newFrame - cm_base)/PAGE_SIZE].isAllocated == 1);
+  
+  coremap[(newFrame - cm_base)/PAGE_SIZE].lastInBlock = 1;
+  coremap[(newFrame - cm_base)/PAGE_SIZE].isKernel = 0;
+  
+  (as->as_pagetable->PT)[PT1ind][PT2ind] = newFrame|TLBLO_DIRTY|TLBLO_VALID;
+  
+  memcpy(PADDR_TO_KVADDR(phyAddr),PADDR_TO_KVADDR(wtf),PAGE_SIZE);
+  cm_map(as, PT1ind<<22|PT2ind<<12,phyAddr);
+ 
+	//DEBUG(DB_VM, "Flushing TLB\n");
+	int i;
+	for (i=0; i<NUM_TLB; i++) {
+		TLB_Write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
+	}
+
+ 
+}
